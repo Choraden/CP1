@@ -5,12 +5,9 @@ import java.util.Collections;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
-import java.util.TreeSet;
 import java.util.HashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.Semaphore;
 
 import cp1.base.ResourceOperation;
@@ -31,14 +28,36 @@ public class TM implements TransactionManager {
     private Long ThreadtoAbort;
     private static Semaphore mutex;
     private LocalTimeProvider timeProvider;
+
+    // To save entry time of each transaction.
     private ConcurrentMap<Long, Long> timer;
+
+    // Keeps info wheather transaction is active/aborted/inactive.
     private ConcurrentMap<Long, Integer> ActiveTransactions;
+
+    // Semaphore for every Resource to know the next thread
+    // that is going to acquire this resource.
+    // Semaphore fairness is set to true.
     private ConcurrentMap<ResourceId, Semaphore> onResource;
+
+    // Semaphore for every Resource to know the queue of threads
+    // that are going to acquire resource.
+    // Semaphore fairness is set to true.
     private ConcurrentMap<ResourceId, Semaphore> wait;
+
+    // Keeps info about already taken resources.
     private ConcurrentMap<ResourceId, Long> takenResources;
+
+    // Transactions that are first to take resource when it will be released.
     private ConcurrentMap<Long, ResourceId> waitingOnResource;
+
+    // To store resources.
     private ArrayList<Resource> resources;
+
+    // To store operations that have already been done in a current transactions.
     private ConcurrentMap<Long, List<Operation>> OperationLogs;
+
+    // To store threads that are being considered in isDeadLock method.
     private Map<Long, Integer> threadsList;
 
     public TM(Collection<Resource> resources,
@@ -48,8 +67,8 @@ public class TM implements TransactionManager {
         onResource = new ConcurrentHashMap<>();
         wait = new ConcurrentHashMap<>();
         for (Resource r : this.resources) {
-            onResource.computeIfAbsent(r.getId(), (k) -> new Semaphore (1, true));
-            wait.computeIfAbsent(r.getId(), (k) -> new Semaphore (1, true));
+            onResource.computeIfAbsent(r.getId(), (k) -> new Semaphore(1, true));
+            wait.computeIfAbsent(r.getId(), (k) -> new Semaphore(1, true));
         }
         waitingOnResource = new ConcurrentHashMap<>();
         ActiveTransactions = new ConcurrentHashMap<>();
@@ -69,26 +88,27 @@ public class TM implements TransactionManager {
         return null;
     }
 
-    private void setThreadtoAbort (long currentThread) {
+    private void setThreadtoAbort(long currentThread) {
         if (timer.get(currentThread) > timer.get(ThreadtoAbort)) {
             ThreadtoAbort = currentThread;
+
         } else if (timer.get(currentThread) == timer.get(ThreadtoAbort)
-                   && currentThread > ThreadtoAbort) {
-                ThreadtoAbort = currentThread;
+                && currentThread > ThreadtoAbort) {
+            ThreadtoAbort = currentThread;
         }
     }
 
     private boolean checkForCycle(long currentThread) {
-        setThreadtoAbort(currentThread);
         if (threadsList.get(currentThread) == ACTIVE)
             return true;
 
         threadsList.computeIfAbsent(currentThread, k -> ACTIVE);
+        setThreadtoAbort(currentThread);
         ResourceId resId = waitingOnResource.get(currentThread);
         if (resId == null)
             return false;
 
-        long newThread = takenResources.get(resId);
+        Long newThread = takenResources.get(resId);
         return checkForCycle(newThread);
     }
 
@@ -103,8 +123,7 @@ public class TM implements TransactionManager {
         if (!ActiveTransactions.containsKey(currentThreadId)) {
             ActiveTransactions.computeIfAbsent(currentThreadId, (k) -> ACTIVE);
             timer.computeIfAbsent(currentThreadId, (k) -> timeProvider.getTime());
-        }
-        else
+        } else
             throw new AnotherTransactionActiveException();
     }
 
@@ -130,40 +149,58 @@ public class TM implements TransactionManager {
         if (Thread.currentThread().isInterrupted())
             throw new InterruptedException();
 
-        mutex.acquire();
+        mutex.acquireUninterruptibly();
         Long threadOnResource = takenResources.get(rid);
-        if (threadOnResource == null) {
+        if (threadOnResource == null) {  // Resource is not taken.
             takenResources.computeIfAbsent(rid, (k) -> currentThread);
             mutex.release();
-            onResource.get(rid).acquire();
-        }
-        else if (threadOnResource != currentThread) {
+            onResource.get(rid).acquireUninterruptibly();
+
+        } else if (threadOnResource != currentThread) { // Resource is already taken and this thread has to wait.
             mutex.release();
-            wait.get(rid).acquire();
+            wait.get(rid).acquireUninterruptibly();
+            mutex.acquireUninterruptibly();
             waitingOnResource.computeIfAbsent(currentThread, (k) -> rid);
-            mutex.acquire();
             if (isDeadlock(currentThread)) {
                 ResourceId resToRelease = waitingOnResource.remove(ThreadtoAbort);
                 ActiveTransactions.computeIfPresent(ThreadtoAbort, (k, v) -> ABORTED);
                 wait.get(resToRelease).release();
             }
             mutex.release();
-            onResource.get(rid).acquire();
+            onResource.get(rid).acquireUninterruptibly();
             if (ActiveTransactions.get(currentThread) == ABORTED) {
                 Thread.currentThread().interrupt();
                 onResource.get(rid).release();
-                return;
+                throw new ActiveTransactionAborted();
             }
+            mutex.acquireUninterruptibly();
             waitingOnResource.remove(currentThread);
             takenResources.computeIfAbsent(rid, k -> currentThread);
+            mutex.release();
             wait.get(rid).release();
+
         } else {
             mutex.release();
         }
 
+        if (Thread.currentThread().isInterrupted()) {
+            throw new InterruptedException();
+        }
+
+        try {
+            res.apply(operation);
+        } catch (ResourceOperationException e) {
+            throw new ResourceOperationException(rid, operation);
+        }
+
+        if (Thread.currentThread().isInterrupted()) {
+            res.unapply(operation);
+            throw new InterruptedException();
+        }
+
         OperationLogs.computeIfAbsent(currentThread, k -> new ArrayList<Operation>());
         OperationLogs.get(currentThread).add(new Operation(rid, operation));
-        res.apply(operation);
+
     }
 
     public void commitCurrentTransaction()
@@ -181,6 +218,8 @@ public class TM implements TransactionManager {
 
         OperationLogs.remove(currentThread);
         timer.remove(currentThread);
+
+        mutex.acquireUninterruptibly();
         for (Resource res : resources) {
             ResourceId rid = res.getId();
             if (takenResources.get(rid) == currentThread) {
@@ -188,6 +227,7 @@ public class TM implements TransactionManager {
                 onResource.get(rid).release();
             }
         }
+        mutex.release();
         ActiveTransactions.remove(currentThread);
     }
 
@@ -201,6 +241,7 @@ public class TM implements TransactionManager {
             }
         }
         timer.remove(currentThread);
+        mutex.acquireUninterruptibly();
         for (Resource res : resources) {
             ResourceId rid = res.getId();
             if (takenResources.get(rid) == currentThread) {
@@ -208,7 +249,9 @@ public class TM implements TransactionManager {
                 onResource.get(rid).release();
             }
         }
+        mutex.release();
         ActiveTransactions.remove(currentThread);
+
     }
 
     public boolean isTransactionActive() {
